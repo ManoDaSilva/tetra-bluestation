@@ -152,7 +152,7 @@ impl SoapyIo {
                     ];
                 }
             }
-            "limesdr" => {
+            "lime" => {
                 if let Some(cfg) = &soapy_cfg.io_cfg.iocfg_limesdr {
                     // Override antenna settings if specified
                     if let Some(ref ant) = cfg.rx_ant {

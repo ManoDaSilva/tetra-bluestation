@@ -21,7 +21,7 @@ impl SoapySdrIoCfg {
         if self.iocfg_usrpb2xx.is_some() {
             "uhd"
         } else if self.iocfg_limesdr.is_some() {
-            "limesdr"
+            "lime"
         } else if self.iocfg_sxceiver.is_some() {
             "sx"
         } else {
