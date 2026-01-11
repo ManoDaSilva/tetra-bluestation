@@ -470,10 +470,10 @@ impl UmacBs {
             }
         };
 
+        // Truncate len if past end (okay with standard)
         if pdu_len_bits > prim.pdu.get_len() {
-            // tracing::warn!("rx_mac_data: Strange length_ind {} in MAC resource, truncating from {} to {}", pdu.length_ind, pdu_len_bits, prim.pdu.get_len());
-            // pdu_len_bits = prim.pdu.get_len() as usize;
-            panic!();
+            tracing::warn!("truncating MAC-DATA len from {} to {}", pdu_len_bits, prim.pdu.get_len());
+            pdu_len_bits = prim.pdu.get_len() as usize;
         }
 
         // Strip fill bits. Maintain original end to allow for later parsing of a second mac block
@@ -595,28 +595,6 @@ impl UmacBs {
         let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {panic!()};
         assert!(prim.pdu.get_pos() == 0); // We should be at the start of the MAC PDU
 
-
-            // TESTING CODE FOR UL/DL SYNCHRONIZATION
-            // let addr = TetraAddress {
-            //     encrypted: false,
-            //     ssi: 0xff00ff,
-            //     ssi_type: SsiType::Issi,
-            // };
-            // let res = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
-            // let mut buf = BitBuffer::new_autoexpand(32);
-            // let ts = message.t_submit;
-            // let ts_ul = message.t_submit.add_timeslots(-2);
-            // buf.write_bits(0xFFFF, 16);
-            // buf.write_bits(ts.t as u64, 8); 
-            // buf.write_bits(ts.f as u64, 8);
-            // buf.write_bits(ts.m as u64, 8);
-            // buf.write_bits(ts.h as u64, 16);
-            // buf.write_bits(0xFFFF, 16);
-            // buf.seek(0);
-            // self.channel_scheduler.dl_enqueue_tma(ts_ul.t, res, buf);
-
-            // return;
-
         let pdu = match MacAccess::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
@@ -662,10 +640,13 @@ impl UmacBs {
             // No length ind, we have capacity request. Fill slot.
             pdu_len_bits = prim.pdu.get_len();
         }
+        if pdu_len_bits > prim.pdu.get_len() { 
+            tracing::warn!("truncating MAC-ACCESS len from {} to {}", pdu_len_bits, prim.pdu.get_len());
+            pdu_len_bits = prim.pdu.get_len(); 
+        }
 
         // Strip fill bits. Maintain original end to allow for later parsing of a second mac block
         // tracing::trace!("rx_mac_access: {}", prim.pdu.dump_bin_full(true));
-        assert!(pdu_len_bits <= prim.pdu.get_len(), "MAC-ACCESS pdu longer than buf");
         let num_fill_bits = if pdu.fill_bits {
             fillbits::removal::get_num_fill_bits(&prim.pdu, pdu_len_bits, pdu.is_null_pdu())
         } else {
@@ -832,6 +813,11 @@ impl UmacBs {
             // No length ind, we have capacity request. Fill slot.
             prim.pdu.get_len()
         };
+        if pdu_len_bits > prim.pdu.get_len() { 
+            tracing::warn!("truncating MAC-END-UL len from {} to {}", pdu_len_bits, prim.pdu.get_len());
+            pdu_len_bits = prim.pdu.get_len(); 
+        }
+
 
         // Strip fill bits if any
         let num_fill_bits = {
@@ -931,7 +917,6 @@ impl UmacBs {
             }
             let len = length_ind as usize * 8;
             if len > prim.pdu.get_len() {
-                tracing::warn!("rx_mac_end_hu: length_ind > buf len, using buf len");
                 prim.pdu.get_len()
             } else {
                 len
@@ -940,7 +925,11 @@ impl UmacBs {
             // No length ind, we have capacity request. Fill slot.
             prim.pdu.get_len()
         };
-        // Max length is buf length
+        if pdu_len_bits > prim.pdu.get_len() { 
+            tracing::warn!("truncating MAC-END-HU len from {} to {}", pdu_len_bits, prim.pdu.get_len());
+            pdu_len_bits = prim.pdu.get_len(); 
+        }
+
         
 
         // Strip fill bits if any

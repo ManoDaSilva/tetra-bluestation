@@ -1,4 +1,4 @@
-use crate::{saps::tmv::{enums::logical_chans::LogicalChannel, {TmvUnitdataReq, TmvUnitdataReqSlot}}, common::{address::TetraAddress, bitbuffer::BitBuffer, tdma_time::TdmaTime, tetra_common::Todo}, entities::{lmac::components::scramble::SCRAMB_INIT, mle::pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo}, umac::{enums::{access_assign_dl_usage::AccessAssignDlUsage, access_assign_ul_usage::AccessAssignUlUsage, basic_slotgrant_cap_alloc::BasicSlotgrantCapAlloc, basic_slotgrant_granting_delay::BasicSlotgrantGrantingDelay, reservation_requirement::ReservationRequirement}, fields::basic_slotgrant::BasicSlotgrant, pdus::{access_assign::{AccessAssign, AccessField}, access_assign_fr18::AccessAssignFr18, mac_resource::MacResource, mac_sync::MacSync, mac_sysinfo::MacSysinfo}, subcomp::fillbits}}, unimplemented_log};
+use crate::{common::{address::TetraAddress, bitbuffer::BitBuffer, tdma_time::TdmaTime, tetra_common::Todo}, entities::{lmac::components::scramble::SCRAMB_INIT, mle::pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo}, umac::{enums::{access_assign_dl_usage::AccessAssignDlUsage, access_assign_ul_usage::AccessAssignUlUsage, basic_slotgrant_cap_alloc::BasicSlotgrantCapAlloc, basic_slotgrant_granting_delay::BasicSlotgrantGrantingDelay, reservation_requirement::ReservationRequirement}, fields::basic_slotgrant::BasicSlotgrant, pdus::{access_assign::{AccessAssign, AccessField}, access_assign_fr18::AccessAssignFr18, mac_resource::MacResource, mac_sync::MacSync, mac_sysinfo::MacSysinfo}, subcomp::{fillbits, dl_frag::DlFragger}}}, saps::tmv::{TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel}, unimplemented_log};
 
 /// We submit this many TX timeslots ahead of the current time
 pub const MACSCHED_TX_AHEAD: usize = 1;
@@ -53,7 +53,7 @@ pub enum DlSchedElem {
     Resource(MacResource, BitBuffer),
 
     /// A FragBuf containing remaining non-transmitted information after a MAC-RESOURCE start has been transmitted
-    FragBuf(Todo),
+    FragBuf(DlFragger),
 }
 
 const EMPTY_SCHED_ELEM: TimeslotSchedule = TimeslotSchedule {
@@ -268,6 +268,13 @@ impl BsChannelScheduler {
         self.dltx_queues[timeslot as usize - 1].push(elem);
     }
 
+    pub fn dl_enqueue_tma_frag(&mut self, timeslot: u8, fragger: DlFragger) {
+        tracing::debug!("dl_enqueue_tma_frag: ts {} enqueueing {:?}", timeslot, fragger);
+        let elem = DlSchedElem::FragBuf(fragger);
+        self.dltx_queues[timeslot as usize - 1].push(elem);
+    }
+
+
     pub fn dl_schedule_tmb(&mut self, _traffic: BitBuffer, _ts: &TdmaTime) {
         unimplemented!("Broadcast scheduling not implemented yet");
     }
@@ -481,7 +488,7 @@ impl BsChannelScheduler {
         self.precomps.mac_sysinfo2.hyperframe_number = Some(ts.h);
         
         // TODO FIXME allocate only if we have something to put in it
-        let mut buf_opt = BitBuffer::new(SCH_F_CAP);
+        let mut buf = BitBuffer::new(SCH_F_CAP);
 
         // Integrate all grants and random access acks into resources (either existing or new)
         self.dl_integrate_sched_elems_for_timeslot(ts);
@@ -504,15 +511,60 @@ impl BsChannelScheduler {
                             
                             let sdu_bits = sdu.get_len();
                             let num_fill_bits = pdu.update_len_and_fill_ind(sdu_bits);
+                            pdu.to_bitbuf(&mut buf);
+                            buf.copy_bits(&mut sdu, sdu_bits);
+                            fillbits::addition::write(&mut buf, Some(num_fill_bits));
+                            tracing::debug!("-> finalized {:?} sdu {}", pdu, sdu.dump_bin());
 
-                            pdu.to_bitbuf(&mut buf_opt);
-                            buf_opt.copy_bits(&mut sdu, sdu_bits);
-                            fillbits::addition::write(&mut buf_opt, Some(num_fill_bits));
-                            tracing::debug!("<- finalized {:?} sdu {}", pdu, sdu.dump_bin());
+                            // let sdu_len = sdu.get_len();
+                            // let pdu_len = pdu.compute_header_len();
+                            // let num_fill_bits = fillbits::addition::compute_required_naive(pdu_len + sdu_len);
+                            // let total_len = pdu_len + sdu_len + num_fill_bits;
+
+                            // // Check if we can fit this into the space that remains in this buf
+                            // // It's very much possible that if the byte boundary is within the MAC block, but the 
+                            // // fill bits would overflow the mac block, we could just fill until the boundary. However,
+                            // // I don't want to risk this edge case. Fragmentation is the safest choice.
+                            // if total_len <= buf.get_len_remaining() {
+                                
+                            //     // Can send in single MAC-RESOURCE
+                            //     let fill_bits_added = pdu.update_len_and_fill_ind(sdu_len);
+                            //     assert_eq!(fill_bits_added, num_fill_bits, "computed num_fill_bits mismatch");
+                            //     pdu.to_bitbuf(&mut buf);
+                            //     // assert_eq!(pdu_len, buf.get_len(), "pdu len mismatch");
+                            //     buf.copy_bits(&mut sdu, sdu_len);
+                            //     fillbits::addition::write(&mut buf, Some(num_fill_bits));
+                            //     tracing::debug!("-> finalized {:?} sdu {}", pdu, sdu.dump_bin());
+                            // } else {
+                            //     // Need to fragment into MAC-RESOURCE, [MAC-FRAG], MAC-END
+                            //     let mut fragger = DlFragger::new(pdu, sdu);
+                            //     let done = fragger.get_next_chunk(&mut buf);
+                            //     if !done {
+                            //         // Almost certain, as we start fragging for a reason
+                            //         // However, to catch some weird edge case, we check
+                            //         // Enqueue fragger if not yet done. 
+                            //         self.dl_enqueue_tma_frag(ts.t, fragger);    
+                            //     } else {
+                            //         // Should never happen
+                            //         assert_warn!(!done, "made fragger but already done");
+                            //     }
+                            //     unimplemented!("NEEDS TESTING");
+                            // }
+                            // let mut fragger = DlFragger::new(pdu, sdu);
+                            // if !fragger.get_next_chunk(&mut buf) {
+                            //     // Fragmentation was started and we have more chunks to send
+                            //     // Enqueue fragger with remaining data for retrieval next frame
+                            //     self.dl_enqueue_tma_frag(ts.t, fragger);    
+                            // }
                         },
                         
-                        DlSchedElem::FragBuf(_) => {
-                            unimplemented_log!("finalize_ts_for_tick: FragBuf scheduling not implemented");
+                        DlSchedElem::FragBuf(mut fragger) => {
+                            if !fragger.get_next_chunk(&mut buf) {
+                                // Fragmentation was continued and we still have more chunks to send
+                                // Re-enqueue fragger with remaining data for retrieval next frame
+                                self.dl_enqueue_tma_frag(ts.t, fragger);
+                            }                            
+                            unimplemented!("NEEDS TESTING");
                         }
 
                         _ => panic!("finalize_ts_for_tick: Unexpected DlSchedElem type: {:?}", sched_elem)
@@ -526,7 +578,7 @@ impl BsChannelScheduler {
         }
         
         // Check if any signalling message was put
-        let mut elem = if buf_opt.get_pos() == 0 {
+        let mut elem = if buf.get_pos() == 0 {
             // Put default SYNC/SYSINFO frame
             TmvUnitdataReqSlot {
                 ts,
@@ -539,7 +591,7 @@ impl BsChannelScheduler {
                 ts,
                 blk1: Some(TmvUnitdataReq {
                     logical_channel: LogicalChannel::SchF,
-                    mac_block: buf_opt,
+                    mac_block: buf,
                     scrambling_code: self.scrambling_code,
                 }),
                 blk2: None, // MAY be populated later

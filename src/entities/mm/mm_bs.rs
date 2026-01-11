@@ -1,10 +1,8 @@
 use crate::config::stack_config::SharedConfig;
 use crate::common::messagerouter::MessageQueue;
 use crate::entities::mm::components::not_supported::make_ul_mm_pdu_function_not_supported;
-use crate::entities::mm::enums::energy_saving_mode::EnergySavingMode;
 use crate::entities::mm::enums::location_update_type::LocationUpdateType;
 use crate::entities::mm::enums::status_uplink::StatusUplink;
-use crate::entities::mm::fields::energy_saving_information::EnergySavingInformation;
 use crate::entities::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
 use crate::entities::mm::fields::group_identity_uplink::GroupIdentityUplink;
 use crate::entities::mm::pdus::u_mm_status::UMmStatus;
@@ -390,7 +388,9 @@ impl MmBs {
             supported = false;
         }
         // pub class_of_ms: Option<u64>, currently not parsed nor interpreted
-        // pdu.energy_saving_mode supported
+        if pdu.energy_saving_mode.is_some() {
+            unimplemented_log!("Unsupported energy_saving_mode present");
+        }
         if pdu.la_information.is_some() {
             unimplemented_log!("Unsupported la_information present");
         }

@@ -8,13 +8,12 @@ use crate::common::bitbuffer::BitBuffer;
 pub struct DlFragger {
     resource: MacResource,
     mac_hdr_is_written: bool,
+    done: bool,
     sdu: BitBuffer
 }
 
 /// We won't start fragmentation if less than MIN_SLOT_CAP_FOR_FRAG_START bits are free in the slot
 const MIN_SLOT_CAP_FOR_FRAG_START: usize = 32; 
-
-
 
 impl DlFragger {
 
@@ -25,6 +24,7 @@ impl DlFragger {
         DlFragger { 
             resource,
             mac_hdr_is_written: false,
+            done: false,
             sdu
         }
     }
@@ -64,14 +64,12 @@ impl DlFragger {
             self.resource.length_ind = total_len_bytes as u8;
             self.resource.fill_bits = num_fill_bits > 0;
 
+            tracing::debug!("-> {:?} sdu {}", self.resource, self.sdu.raw_dump_bin(false, false, self.sdu.get_pos(), self.sdu.get_pos() + sdu_len_bits));
+
             // Write MAC-RESOURCE header, followed by TM-SDU, to MAC block
             self.resource.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_len_bits);
             fillbits::addition::write(mac_block, Some(num_fill_bits));
-
-            tracing::debug!("Creating MAC-RESOURCE, len: {} (sdu bits: {}), fillbits: {}, pdu: {:?}", 
-                sdu_len_bits, sdu_len_bits, num_fill_bits, self.resource);
-            tracing::debug!("buffer: {}", mac_block.dump_bin());
 
             // We're done with this packet
             self.mac_hdr_is_written = true;
@@ -81,18 +79,18 @@ impl DlFragger {
             
             // Not worth starting fragmentation here. Rather wait for a new slot 
             // We don't update self.mac_hdr_is_written and simply return that more work is needed
+            tracing::debug!("-> does_not_fit, trying again next frame");
             false
+
 
         } else {
 
             // We need to start fragmentation. No fill bits are needed
             self.resource.length_ind = 0b111111; // Start of fragmentation
             self.resource.fill_bits = false;
-
             let sdu_bits = slot_cap_bits - hdr_len_bits;
 
-            tracing::debug!("Creating MAC-RESOURCE (fragged), len: {} (sdu bits: {}, remaining: {})", 
-                sdu_len_bits, sdu_bits, self.sdu.get_len_remaining() - sdu_bits);
+            tracing::debug!("-> {:?} sdu {}", self.resource, self.sdu.raw_dump_bin(false, false, self.sdu.get_pos(), self.sdu.get_pos() + sdu_bits));
 
             self.resource.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_bits);
@@ -122,7 +120,6 @@ impl DlFragger {
 
         // tracing::trace!("MAC-END would have length: {} bits, {} bytes, slot capacity: {} bits", 
         //     macend_len_bits, macend_len_bytes, slot_cap);
-        
         if macend_len_bytes * 8 <= slot_cap {
             // Fits in single MAC-END
             let num_fill_bits = fillbits::addition::compute_required_naive(macend_len_bits);
@@ -134,9 +131,8 @@ impl DlFragger {
                 chan_alloc_element: None,
             };
 
-            tracing::debug!("Creating MAC-END with length: {} (sdu bits: {}) slot capacity: {} bits", 
-                macend_len_bits, sdu_bits, slot_cap);
-        
+            tracing::debug!("-> {:?} sdu {}", pdu, self.sdu.raw_dump_bin(false, false, self.sdu.get_pos(), self.sdu.get_pos() + sdu_bits));
+
             // Write MAC-END header followed by TM-SDU
             pdu.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_bits);
@@ -156,12 +152,14 @@ impl DlFragger {
             let sdu_bits_in_frag = min(slot_cap - macfrag_hdr_len, sdu_bits);
             let num_fill_bits = slot_cap - macfrag_hdr_len - sdu_bits_in_frag;
 
-            tracing::debug!("Creating MAC-FRAG, sdu bits: {}, remaining {}, slot capacity: {}, fillbits: {}", 
-                sdu_bits_in_frag, sdu_bits - sdu_bits_in_frag, slot_cap, num_fill_bits);
+            
 
             let pdu = MacFragDl {
                 fill_bits: num_fill_bits > 0,
             };
+
+            tracing::debug!("-> {:?} sdu {}", pdu, self.sdu.raw_dump_bin(false, false, self.sdu.get_pos(), self.sdu.get_pos() + sdu_bits));
+
             pdu.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_bits_in_frag);
 
@@ -174,14 +172,21 @@ impl DlFragger {
         }
     }
 
+    /// Writes the next chunk to the bitbuffer, if there is space.
+    /// First chunk is the provided resource, possibly changed to indicate fragmentation.
+    /// Subsequent chunks are MAC-FRAG or MAC-END.
+    /// Returns (bool is_done, usize bits_written) 
     pub fn get_next_chunk(&mut self, mac_block: &mut BitBuffer) -> bool {
-        if !self.mac_hdr_is_written {
+        assert!(!self.done, "all fragments have already been produced");
+        self.done = if !self.mac_hdr_is_written {
             // First chunk, write MAC-RESOURCE
             self.get_resource_chunk(mac_block)
         } else {
             // Subsequent chunks, write MAC-FRAG or MAC-END
             self.get_frag_or_end_chunk(mac_block)
-        }
+        };
+
+        self.done
     }
 }
 
@@ -189,7 +194,7 @@ impl DlFragger {
 
 #[cfg(test)]
 mod tests {
-    use crate::{common::{address::{SsiType, TetraAddress}, bitbuffer::BitBuffer, debug}, entities::umac::{pdus::mac_resource::MacResource, subcomp::{bs_sched::{SCH_F_CAP, SCH_HD_CAP}, frag::DlFragger}}};
+    use crate::{common::{address::{SsiType, TetraAddress}, bitbuffer::BitBuffer, debug}, entities::umac::{pdus::{mac_end_dl::MacEndDl, mac_frag_dl::MacFragDl, mac_resource::MacResource}, subcomp::{bs_sched::{SCH_F_CAP, SCH_HD_CAP}, dl_frag::DlFragger}}};
 
     fn get_default_resource() -> MacResource {
         MacResource {
@@ -220,40 +225,88 @@ mod tests {
         
         let mut fragger = DlFragger::new(pdu, sdu);
         let done = fragger.get_next_chunk(&mut mac_block);
+        mac_block.seek(0);
 
         assert!(done, "Should be done in single chunk");
         tracing::info!("MAC block: {}", mac_block.dump_bin());
     }
 
     #[test]
-    fn test_two_chunks() { 
+    fn test_four_chunks() { 
         debug::setup_logging_verbose();
+        let vec = "01010110010011000010101010010010110101010110010011001011111110101011001010010110111001011111111111100010011000000011010011001110010111110010100100010111010110000010010001101000011000000111101011010001001111001110110100000101010111110100010000100101001100011110010111001010101001110110111010001001101101111100111001000001111100101010000010111";
+        let mut reconstructed = String::new();
         let pdu = get_default_resource();
-        let sdu = BitBuffer::from_bitstr("010101100100110000101010100100101101010101100100000001101001100111001011111001010010001011101011000001001000110100001100");
-        let mut mac_block1 = BitBuffer::new(SCH_HD_CAP);
-        let mut mac_block2 = BitBuffer::new(SCH_HD_CAP);
-        
+        let sdu = BitBuffer::from_bitstr(vec);
         let mut fragger = DlFragger::new(pdu, sdu);
-        let done = fragger.get_next_chunk(&mut mac_block1);
-        tracing::info!("MAC block1: {}", mac_block1.dump_bin());
-        assert!(!done, "Should take two blocks");
-        let done = fragger.get_next_chunk(&mut mac_block2);
-        tracing::info!("MAC block2: {}", mac_block2.dump_bin());
-        assert!(done, "Should take two blocks");
+
+        let mut mac_block = BitBuffer::new(SCH_HD_CAP);
+        let done = fragger.get_next_chunk(&mut mac_block);
+        mac_block.seek(0);
+        let pdu = MacResource::from_bitbuf(&mut mac_block).unwrap();
+        mac_block.set_raw_start(mac_block.get_raw_pos());
+        tracing::info!("[1]: {}: {}", pdu, mac_block.dump_bin());
+        reconstructed += &mac_block.to_bitstr();
+        // tracing::info!("[1] reconstructed so far: {}", reconstructed);
+        assert!(!done, "Should take four blocks");
+        
+        let mut mac_block = BitBuffer::new(SCH_HD_CAP);
+        let done = fragger.get_next_chunk(&mut mac_block);
+        mac_block.seek(0);
+        let pdu = MacFragDl::from_bitbuf(&mut mac_block).unwrap();
+        mac_block.set_raw_start(mac_block.get_raw_pos());
+        tracing::info!("[2]: {}: {}", pdu, mac_block.dump_bin());
+        reconstructed += &mac_block.to_bitstr();
+        // tracing::info!("[1] reconstructed so far: {}", reconstructed);
+        assert!(!done, "Should take four blocks");
+
+        let mut mac_block = BitBuffer::new(SCH_HD_CAP);
+        let done = fragger.get_next_chunk(&mut mac_block);
+        mac_block.seek(0);
+        let pdu = MacFragDl::from_bitbuf(&mut mac_block).unwrap();
+        mac_block.set_raw_start(mac_block.get_raw_pos());
+        tracing::info!("[3]: {}: {}", pdu, mac_block.dump_bin());
+        reconstructed += &mac_block.to_bitstr();
+        // tracing::info!("[1] reconstructed so far: {}", reconstructed);
+        assert!(!done, "Should take four blocks");
+
+        let mut mac_block = BitBuffer::new(SCH_HD_CAP);
+        let done = fragger.get_next_chunk(&mut mac_block);
+        mac_block.seek(0);
+        let pdu = MacEndDl::from_bitbuf(&mut mac_block).unwrap();
+        mac_block.set_raw_start(mac_block.get_raw_pos());
+        tracing::info!("[4]: {}: {}", pdu, mac_block.dump_bin());
+        reconstructed += &mac_block.to_bitstr();
+        tracing::info!("     Reconstructed: {}", reconstructed);
+        assert!(done, "Should take four blocks");
+        
+        // Test that the original vec is contained in the reconstructed string
+        // We'll just assume the fill bits check out..
+        assert!(reconstructed.starts_with(vec), "Original vec should be contained in reconstructed string");
     }
 
-    #[test]
-    fn test_four_chunks() {
-
-    }
 
     #[test]
-    fn test_semifilled() {
+    fn test_low_cap_start_and_no_room_for_fill_bits() { 
+        debug::setup_logging_verbose();
+        let vec = "010101100100110000";
+        let pdu = get_default_resource();
+        let sdu = BitBuffer::from_bitstr(vec);
+        let mut fragger = DlFragger::new(pdu, sdu);
 
-    }
+        let mut mac_block = BitBuffer::new(30); // Too small for proper message
+        let done = fragger.get_next_chunk(&mut mac_block);
+        tracing::info!("[1]: {}", mac_block.dump_bin());
+        assert!(!done);
 
-    #[test]
-    fn test_boundary_conditions() {
+        let mut mac_block = BitBuffer::new(61); // Too small for proper message
+        let done = fragger.get_next_chunk(&mut mac_block);
+        tracing::info!("[2]: {}", mac_block.dump_bin());
+        assert!(!done, "fill bits shouldnt fit");
 
+        let mut mac_block = BitBuffer::new(61); // Too small for proper message
+        let done = fragger.get_next_chunk(&mut mac_block);
+        tracing::info!("[3]: {}", mac_block.dump_bin());
+        assert!(done);
     }
 }
