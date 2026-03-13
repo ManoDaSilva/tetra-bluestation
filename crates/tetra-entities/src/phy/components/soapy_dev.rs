@@ -446,10 +446,10 @@ impl TxDsp {
 
         // fcfb.process() returns &[ComplexSample] — a shared borrow of the
         // internal IFFT buffer.  We must copy to apply DPD in-place.
-        let tx_signal_raw = self.fcfb.process();
+        let tx_signal = self.fcfb.process();
 
         // TODO: compensate for delay of SDR
-        let sdr_sample_count = tx_signal_raw.len() as SampleCount * self.block_count;
+        let sdr_sample_count = tx_signal.len() as SampleCount * self.block_count;
 
         // Increment block count before calling sdr.transmit with ?,
         // so we do not end up producing the same block again even if transmit fails.
@@ -457,12 +457,12 @@ impl TxDsp {
 
         // Fast path: identity coefficients [1.0] — skip DPD entirely.
         if self.dpd_coeffs.len() == 1 && self.dpd_coeffs[0] == 1.0 {
-            sdr.transmit(tx_signal_raw, Some(sdr_sample_count))?;
+            sdr.transmit(tx_signal, Some(sdr_sample_count))?;
         } else {
             // Polynomial predistortion: y[n] = x[n] * P(|x[n]|)
             // P(r) = c0 + c1*r + c2*r^2 + ... evaluated via Horner's method.
             // Phase of each sample is preserved; only magnitude is corrected.
-            let tx_signal: Vec<ComplexSample> = tx_signal_raw
+            let tx_signal: Vec<ComplexSample> = tx_signal
                 .iter()
                 .map(|&x| {
                     let mag = x.norm();
