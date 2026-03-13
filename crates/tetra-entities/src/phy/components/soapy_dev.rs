@@ -126,7 +126,7 @@ impl RxTxDevSoapySdr {
             },
 
             tx_dsp: if sdr.tx_enabled() {
-                Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
+                Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config, cfg))
             } else {
                 None
             },
@@ -348,10 +348,14 @@ struct TxDsp {
     block_count: fcfb::BlockCount,
     initial_time: i64,
     modulators: Vec<ModulatorChannel>,
+    /// Polynomial predistortion coefficients [c0, c1, c2, ...].
+    /// Applied as: y = x * (c0 + c1*|x| + c2*|x|^2 + ...)
+    /// A single coefficient of 1.0 is the identity (no-op fast path).
+    dpd_coeffs: Vec<f32>,
 }
 
 impl TxDsp {
-    fn new(fft_planner: &mut FftPlanner, sdr: &mut soapyio::SoapyIo, phy_config: &PhyConfig) -> Self {
+    fn new(fft_planner: &mut FftPlanner, sdr: &mut soapyio::SoapyIo, phy_config: &PhyConfig, cfg: &SharedConfig) -> Self {
         let sdr_sample_rate = sdr.tx_sample_rate();
         let fcfb_params = fcfb::SynthesisOutputParameters {
             ifft_size: (sdr_sample_rate / 500.0).round() as usize,
@@ -367,11 +371,28 @@ impl TxDsp {
             modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *dl_freq, modulator::Mode::Dl));
         }
 
+        // Extract DPD coefficients from config, defaulting to identity [1.0]
+        let dpd_coeffs = cfg
+            .config()
+            .phy_io
+            .soapysdr
+            .as_ref()
+            .and_then(|s| s.predistortion.as_ref())
+            .map(|p| p.coefficients.clone())
+            .unwrap_or_else(|| vec![1.0]);
+
+        if dpd_coeffs.len() == 1 && dpd_coeffs[0] == 1.0 {
+            tracing::info!("PA predistortion: disabled (identity)");
+        } else {
+            tracing::info!("PA predistortion: enabled, {} coefficients: {:?}", dpd_coeffs.len(), dpd_coeffs);
+        }
+
         Self {
             fcfb,
             block_count: 0,
             initial_time: 0, // TODO: get it from RX
             modulators,
+            dpd_coeffs,
         }
     }
 
@@ -423,16 +444,37 @@ impl TxDsp {
             }
         }
 
-        let tx_signal = self.fcfb.process();
+        // fcfb.process() returns &[ComplexSample] — a shared borrow of the
+        // internal IFFT buffer.  We must copy to apply DPD in-place.
+        let tx_signal_raw = self.fcfb.process();
 
         // TODO: compensate for delay of SDR
-        let sdr_sample_count = tx_signal.len() as SampleCount * self.block_count;
+        let sdr_sample_count = tx_signal_raw.len() as SampleCount * self.block_count;
 
         // Increment block count before calling sdr.transmit with ?,
         // so we do not end up producing the same block again even if transmit fails.
         self.block_count += 1;
 
-        sdr.transmit(tx_signal, Some(sdr_sample_count))?;
+        // Fast path: identity coefficients [1.0] — skip DPD entirely.
+        if self.dpd_coeffs.len() == 1 && self.dpd_coeffs[0] == 1.0 {
+            sdr.transmit(tx_signal_raw, Some(sdr_sample_count))?;
+        } else {
+            // Polynomial predistortion: y[n] = x[n] * P(|x[n]|)
+            // P(r) = c0 + c1*r + c2*r^2 + ... evaluated via Horner's method.
+            // Phase of each sample is preserved; only magnitude is corrected.
+            let tx_signal: Vec<ComplexSample> = tx_signal_raw
+                .iter()
+                .map(|&x| {
+                    let mag = x.norm();
+                    let coeffs = &self.dpd_coeffs;
+                    // Horner: start from the highest-degree coefficient
+                    let gain = coeffs.iter().rev().fold(0.0f32, |acc, &c| acc * mag + c);
+                    x * gain
+                })
+                .collect();
+
+            sdr.transmit(&tx_signal, Some(sdr_sample_count))?;
+        }
 
         // tracing::trace!("Produced transmit block {} ({} samples in future)",
         //     self.block_count - 1,

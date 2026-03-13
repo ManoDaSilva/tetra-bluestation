@@ -51,6 +51,7 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> CfgPhyIo {
             dl_freq: soapy_dto.tx_freq,
             ppm_err: soapy_dto.ppm_err.unwrap_or(0.0),
             io_cfg: SoapySdrIoCfg::default(),
+            predistortion: soapy_dto.predistortion,
         };
 
         if let Some(usrp_dto) = soapy_dto.iocfg_usrpb2xx {

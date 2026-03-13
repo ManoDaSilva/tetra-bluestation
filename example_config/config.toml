@@ -68,6 +68,36 @@ tx_gain_pga = 35.0
 
 ###############################################################################
 
+# Polynomial pre-distortion for PA linearisation (optional)
+#
+# Applies a memoryless magnitude polynomial correction to each complex baseband
+# sample immediately before it is sent to the SDR hardware:
+#
+#   y[n] = x[n] * P(|x[n]|)
+#
+# where P(r) = c0 + c1*r + c2*r^2 + c3*r^3 + ...
+#
+# Only the instantaneous magnitude is corrected; the phase of each sample is
+# preserved.  This compensates for AM/AM compression in the PA.
+#
+# To find your coefficients:
+#   1. Measure the PA output power vs. input power (AM/AM curve).
+#   2. Compute the inverse of that curve.
+#   3. Fit a polynomial to the inverse and enter the coefficients here.
+#
+# Coefficient guide:
+#   c0 = 1.0          linear gain (baseline — always set this to 1.0)
+#   c1 = 0.0          first-order magnitude correction (usually 0)
+#   c2 = -0.1..-0.3   compensates 3rd-order compression (most common)
+#   c3 = 0.0..0.1     5th-order correction (use sparingly)
+#
+# [1.0] or omitting this section entirely = no correction (pass-through).
+#
+# [phy_io.soapysdr.predistortion]
+# coefficients = [1.0, 0.0, -0.15, 0.05]
+
+###############################################################################
+
 # Network Information
 [net_info]
 # Mobile Country Code (MCC) - identifies your country
