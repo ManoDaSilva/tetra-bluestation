@@ -2,9 +2,10 @@ use std::time::{Duration, Instant};
 
 use tetra_config::bluestation::{CfgT1Test, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{Sap, TdmaTime};
+use tetra_core::{PhyBlockNum, Sap, TdmaTime, TrainingSequence};
 use tetra_saps::{SapMsg, SapMsgInner};
 
+use crate::t1test::diag::{self, PAYLOAD_BITS};
 use crate::t1test::dl_gen::{T1DlGen, T1DlParams};
 use crate::umac::subcomp::bs_sched::MACSCHED_TX_AHEAD;
 use crate::{MessageQueue, TetraEntityTrait};
@@ -21,9 +22,19 @@ pub struct T1TestBs {
     started: Instant,
     last_report: Instant,
     ticks: u64,
-    ul_bursts_total: u64,
-    ul_bursts_on_slot: u64,
+    /// Uplink bursts detected by the PHY, per uplink timeslot (index 0 is timeslot 1)
+    ul_bursts_per_slot: [u64; 4],
+    /// Uplink bursts detected by the PHY, per training sequence: [normal 1, normal 2, extended]
+    ul_bursts_per_train: [u64; 3],
+
+    /// First half of a burst with two separate blocks, until the second half arrives
+    pending_blk1: Option<[u8; PAYLOAD_BITS / 2]>,
+    /// Number of detected bursts analyzed against the PRBS so far
+    diag_count: u32,
 }
+
+/// Number of detected uplink bursts that get a diagnostic line
+const DIAG_MAX_BURSTS: u32 = 30;
 
 impl T1TestBs {
     pub fn new(config: SharedConfig) -> Self {
@@ -40,8 +51,10 @@ impl T1TestBs {
             started: now,
             last_report: now,
             ticks: 0,
-            ul_bursts_total: 0,
-            ul_bursts_on_slot: 0,
+            ul_bursts_per_slot: [0; 4],
+            ul_bursts_per_train: [0; 3],
+            pending_blk1: None,
+            diag_count: 0,
         }
     }
 
@@ -57,26 +70,78 @@ impl T1TestBs {
     }
 
     fn rx_tp_ind(&mut self, message: SapMsg) {
-        let SapMsgInner::TpUnitdataInd(_prim) = message.msg else {
+        let SapMsgInner::TpUnitdataInd(prim) = message.msg else {
             panic!("T1TestBs: unexpected primitive from PHY");
         };
 
         // Uplink bursts arrive two timeslots after the downlink slot they were sent in
         let ul_time = self.dltime.add_timeslots(-2);
-        self.ul_bursts_total += 1;
-        if ul_time.t == self.cfg.ul_timeslot {
-            self.ul_bursts_on_slot += 1;
+        self.ul_bursts_per_slot[ul_time.t as usize - 1] += 1;
+        match prim.train_type {
+            TrainingSequence::NormalTrainSeq1 => self.ul_bursts_per_train[0] += 1,
+            TrainingSequence::NormalTrainSeq2 => self.ul_bursts_per_train[1] += 1,
+            TrainingSequence::ExtendedTrainSeq => self.ul_bursts_per_train[2] += 1,
+            _ => {}
+        }
+
+        // Collect the 432 payload bits of the burst and run the diagnostic on the first few
+        if self.diag_count >= DIAG_MAX_BURSTS {
+            return;
+        }
+        let mut block = prim.block;
+        let payload = match prim.block_num {
+            PhyBlockNum::Both if block.get_len() == PAYLOAD_BITS => {
+                let mut p = [0u8; PAYLOAD_BITS];
+                block.to_bitarr(&mut p);
+                Some(p)
+            }
+            PhyBlockNum::Block1 if block.get_len() == PAYLOAD_BITS / 2 => {
+                let mut p = [0u8; PAYLOAD_BITS / 2];
+                block.to_bitarr(&mut p);
+                self.pending_blk1 = Some(p);
+                None
+            }
+            PhyBlockNum::Block2 if block.get_len() == PAYLOAD_BITS / 2 => self.pending_blk1.take().map(|b1| {
+                let mut p = [0u8; PAYLOAD_BITS];
+                p[..PAYLOAD_BITS / 2].copy_from_slice(&b1);
+                block.to_bitarr(&mut p[PAYLOAD_BITS / 2..]);
+                p
+            }),
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            self.diag_count += 1;
+            let fits = diag::analyze(&payload, self.dl_gen.scrambling_code());
+            let list: Vec<String> = fits.iter().map(|f| format!("{} {}", f.hypothesis, f.errors)).collect();
+            let best = fits.iter().min_by_key(|f| f.errors).unwrap();
+            println!(
+                "T1 diag {}/{} | f{} ts{} | train {:?} | errors vs PRBS of 432 bits: [{}] | best {} phase {}",
+                self.diag_count,
+                DIAG_MAX_BURSTS,
+                ul_time.f,
+                ul_time.t,
+                prim.train_type,
+                list.join(", "),
+                best.hypothesis,
+                best.phase
+            );
         }
     }
 
     fn print_report(&mut self) {
+        let s = &self.ul_bursts_per_slot;
+        let t = &self.ul_bursts_per_train;
         println!(
-            "T1 | t {:>6.1}s | ticks {} | UL bursts {} (slot {}: {}) | measurement not implemented yet",
+            "T1 | t {:>6.1}s | ticks {} | UL bursts per slot [{} {} {} {}] | per train seq [n1 {} n2 {} ext {}] | measurement not implemented yet",
             self.started.elapsed().as_secs_f32(),
             self.ticks,
-            self.ul_bursts_total,
-            self.cfg.ul_timeslot,
-            self.ul_bursts_on_slot
+            s[0],
+            s[1],
+            s[2],
+            s[3],
+            t[0],
+            t[1],
+            t[2],
         );
     }
 }

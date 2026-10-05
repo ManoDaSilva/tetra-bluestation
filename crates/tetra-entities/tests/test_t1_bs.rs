@@ -3,14 +3,14 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use tetra_config::bluestation::{CfgT1Test, SharedConfig};
-use tetra_core::{BitBuffer, TdmaTime};
+use tetra_core::{BitBuffer, TdmaTime, TrainingSequence};
 use tetra_entities::MessageRouter;
 use tetra_entities::lmac::components::scrambler;
 use tetra_entities::phy::components::slotter::bitseq;
 use tetra_entities::phy::phy_bs::PhyBs;
 use tetra_entities::t1test::T1TestBs;
 use tetra_entities::t1test::prbs::Prbs511;
-use tetra_pdus::phy::traits::rxtx_dev::{RxSlotBits, RxTxDev, RxTxDevError, TxSlotBits};
+use tetra_pdus::phy::traits::rxtx_dev::{RxBurstBits, RxSlotBits, RxTxDev, RxTxDevError, TxSlotBits};
 
 use common::default_stack::default_test_config_bs;
 
@@ -78,4 +78,56 @@ fn t1_stack_transmits_sync_in_frame18_slot1_and_tch72_elsewhere() {
         }
     }
     assert_eq!(num_sync, 2, "one sync burst per multiframe");
+}
+
+/// RF device that reports an uplink burst with a given training sequence every few slots
+struct UplinkDev {
+    train_type: TrainingSequence,
+    burst: Vec<u8>,
+    tick: usize,
+}
+
+impl RxTxDev for UplinkDev {
+    fn rxtx_timeslot(&mut self, tx_slot: &[TxSlotBits]) -> Result<Vec<Option<RxSlotBits<'_>>>, RxTxDevError> {
+        self.tick += 1;
+        if self.tick % 3 != 0 {
+            return Ok(vec![]);
+        }
+        Ok(vec![Some(RxSlotBits {
+            time: tx_slot[0].time,
+            slot: RxBurstBits {
+                train_type: self.train_type,
+                bits: &self.burst,
+            },
+            ..Default::default()
+        })])
+    }
+}
+
+/// Uplink bursts of both normal training sequences are accepted and analyzed without error
+#[test]
+fn t1_stack_handles_detected_uplink_bursts() {
+    for train_type in [TrainingSequence::NormalTrainSeq1, TrainingSequence::NormalTrainSeq2] {
+        let mut stack_cfg = default_test_config_bs();
+        stack_cfg.t1_test = Some(CfgT1Test::default());
+        let cfg = SharedConfig::from_parts(stack_cfg, None);
+
+        // 462 bit normal uplink burst filled with PRBS-like data
+        let mut prbs = Prbs511::new();
+        let mut burst = vec![0u8; 462];
+        prbs.fill(&mut burst);
+
+        let mut router = MessageRouter::new(cfg.clone());
+        router.register_entity(Box::new(PhyBs::new(
+            cfg.clone(),
+            UplinkDev {
+                train_type,
+                burst,
+                tick: 0,
+            },
+        )));
+        router.register_entity(Box::new(T1TestBs::new(cfg.clone())));
+        router.set_dl_time(TdmaTime::default());
+        router.run_stack(Some(60), None);
+    }
 }
