@@ -260,7 +260,12 @@ fn main() {
     let stack_cfg = load_config_from_toml(&args.config);
     let mut cfg = SharedConfig::from_parts(stack_cfg, None);
 
-    let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
+    // In T1 mode logs go to stderr at warn level, so stdout carries only the T1 reports
+    let _log_guards = if cfg.config().t1_test.is_some() {
+        debug::setup_logging_stderr(cfg.config().debug_log.clone())
+    } else {
+        debug::setup_logging_default(cfg.config().debug_log.clone())
+    };
 
     if cfg.config().t1_test.is_some() {
         run_t1_mode(&cfg);

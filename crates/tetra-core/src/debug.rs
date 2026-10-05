@@ -227,7 +227,7 @@ pub fn setup_logging_verbose() {
         .add_directive("quinn=info".parse().unwrap())
         .add_directive("quinn_proto=info".parse().unwrap());
 
-    setup_logging(stdout_filter, None);
+    setup_logging(stdout_filter, None, false);
 }
 
 /// Sets up default logging to stdout and optionally, a verbose log file
@@ -239,7 +239,15 @@ pub fn setup_logging_default(verbose_logfile: Option<String>) -> Option<LogGuard
     } else {
         None
     };
-    setup_logging(stdout_filter, logfile_and_filter)
+    setup_logging(stdout_filter, logfile_and_filter, false)
+}
+
+/// Logging for the BS T1 test mode. Logs go to stderr, so stdout carries only the T1 reports.
+/// The level comes from the RUST_LOG environment variable (for example `RUST_LOG=info`) and defaults to `warn`.
+pub fn setup_logging_stderr(verbose_logfile: Option<String>) -> Option<LogGuards> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let logfile_and_filter = verbose_logfile.map(|file| (file, get_default_logfile_filter()));
+    setup_logging(filter, logfile_and_filter, true)
 }
 
 pub fn get_default_filter() -> EnvFilter {
@@ -283,8 +291,14 @@ fn get_default_logfile_filter() -> EnvFilter {
 
 /// Sets up logging to stdout and optionally, a verbose log file.
 /// Returns guards that must be kept alive for background log draining to continue.
-fn setup_logging(stdout_filter: EnvFilter, outfile: Option<(String, EnvFilter)>) -> Option<LogGuards> {
-    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+/// With `to_stderr` set, the console log goes to stderr instead of stdout.
+fn setup_logging(stdout_filter: EnvFilter, outfile: Option<(String, EnvFilter)>, to_stderr: bool) -> Option<LogGuards> {
+    let console: Box<dyn std::io::Write + Send + 'static> = if to_stderr {
+        Box::new(std::io::stderr())
+    } else {
+        Box::new(std::io::stdout())
+    };
+    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(console);
     if let Some((outfile, outfile_filter)) = outfile {
         // Setup logging with a verbose log file
         let file = OpenOptions::new()

@@ -29,6 +29,7 @@ For receiver validation with a TETRA radio test set (tested with an IFR 2968 in 
 - The report line shows detected and received bursts, the bit error ratio over the whole run and over the last interval, the share of bursts with errors, an errors-per-burst histogram, and the split of errors between the two halves of a burst. A burst is counted as received when it matches the PRBS with at most 30 % bit errors, so very weak signals show up as missing bursts instead of in the BER.
 - With `ber_limit_percent` and `min_bits` set (EN 300 394-1 Table A.5 lists values per test case), the report also shows how far the measurement has settled and a PASS or FAIL verdict.
 - `output = "json"` prints one JSON object per line, for scripts. The last line has `"final": true`. The process exit code is 0 for pass, 1 for fail and 2 when no usable measurement was made (no bits, or fewer than `min_bits`). Set `duration_s` to make a run end by itself.
+- In this mode the T1 reports go to stdout and the log goes to stderr at `warn` level. Use `RUST_LOG=info` (or `debug`) for more log output. The banner and the SDR driver messages also go to stderr, so `2>/dev/null` leaves only the T1 lines.
 - On the test set, use SYNC TO BASE STATION = AUTO and MCC-MNC-BCC UPDATE = AUTO, set the Rx offset to the duplex spacing of the cell, and BS Tx mode to CONTINUOUS ALL SLOTS.
 
 ## Acknowledgements
