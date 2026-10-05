@@ -9,6 +9,7 @@ pub mod mle;
 pub mod mm;
 pub mod phy;
 pub mod sndcp;
+pub mod t1test;
 pub mod umac;
 
 pub mod network;

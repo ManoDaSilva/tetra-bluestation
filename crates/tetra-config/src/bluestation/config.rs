@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
-use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
+use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, CfgT1Test, PhyBackend, StackState};
 
 use super::sec_brew::CfgBrew;
 use super::sec_telemetry::CfgTelemetry;
@@ -69,11 +69,28 @@ pub struct StackConfig {
 
     /// Control endpoint configuration
     pub control: Option<CfgControl>,
+
+    /// BS T1 test mode configuration. Set when the config file says `stack_mode = "BsT1"`.
+    /// In that case `stack_mode` itself is `Bs`, so the PHY and SDR code needs no knowledge of the test mode.
+    pub t1_test: Option<CfgT1Test>,
 }
 
 impl StackConfig {
     /// Validate that all required configuration fields are properly set.
     pub fn validate(&self) -> Result<(), &str> {
+        // T1 test mode runs without any network features
+        if let Some(t1) = self.t1_test.as_ref() {
+            if self.brew.is_some() || self.telemetry.is_some() || self.control.is_some() {
+                return Err("brew, telemetry and command sections must not be set in BsT1 stack mode");
+            }
+            if !(1..=4).contains(&t1.ul_timeslot) {
+                return Err("t1_test.ul_timeslot must be 1-4");
+            }
+            if t1.report_interval_ms < 100 {
+                return Err("t1_test.report_interval_ms must be at least 100");
+            }
+        }
+
         // Check input device settings
         match self.phy_io.backend {
             PhyBackend::SoapySdr => {

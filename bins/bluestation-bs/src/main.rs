@@ -27,6 +27,7 @@ use tetra_entities::{
     mm::mm_bs::MmBs,
     phy::{components::soapy_dev::RxTxDevSoapySdr, phy_bs::PhyBs},
     sndcp::sndcp_bs::Sndcp,
+    t1test::T1TestBs,
     umac::umac_bs::UmacBs,
 };
 
@@ -176,6 +177,29 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     (router, tsource, c_d)
 }
 
+/// Start the BS T1 test mode stack: PHY and the T1 test entity only.
+/// Brew, telemetry, control and the signalling entities are not built.
+fn build_t1_stack(cfg: &SharedConfig) -> MessageRouter {
+    let mut router = MessageRouter::new(cfg.clone());
+
+    match cfg.config().phy_io.backend {
+        PhyBackend::SoapySdr => {
+            let rxdev = RxTxDevSoapySdr::new(cfg);
+            let phy = PhyBs::new(cfg.clone(), rxdev);
+            router.register_entity(Box::new(phy));
+        }
+        _ => {
+            panic!("Unsupported PhyIo type: {:?}", cfg.config().phy_io.backend);
+        }
+    }
+
+    router.register_entity(Box::new(T1TestBs::new(cfg.clone())));
+    eprintln!(" -> BS T1 test mode: network features disabled");
+
+    router.set_dl_time(TdmaTime::default());
+    router
+}
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -188,6 +212,28 @@ struct Args {
     /// Config file (required)
     #[arg(help = "TOML config with network/cell parameters")]
     config: String,
+}
+
+/// Run the BS T1 test mode until Ctrl+C or until the configured duration has passed
+fn run_t1_mode(cfg: &SharedConfig) {
+    let mut router = build_t1_stack(cfg);
+
+    let is_running = Arc::new(AtomicBool::new(true));
+    let is_running_ctrlc = is_running.clone();
+    ctrlc::set_handler(move || {
+        is_running_ctrlc.store(false, Ordering::SeqCst);
+    })
+    .expect("failed to set Ctrl+C handler");
+
+    if let Some(duration_s) = cfg.config().t1_test.as_ref().and_then(|t| t.duration_s) {
+        let is_running_timer = is_running.clone();
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_secs(duration_s as u64));
+            is_running_timer.store(false, Ordering::SeqCst);
+        });
+    }
+
+    router.run_stack(None, Some(is_running));
 }
 
 fn main() {
@@ -206,6 +252,12 @@ fn main() {
     let mut cfg = SharedConfig::from_parts(stack_cfg, None);
 
     let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
+
+    if cfg.config().t1_test.is_some() {
+        run_t1_mode(&cfg);
+        return;
+    }
+
     let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg);
 
     // Start Telemetry and Control threads, if enabled
