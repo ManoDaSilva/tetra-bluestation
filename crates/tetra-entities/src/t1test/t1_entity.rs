@@ -2,15 +2,12 @@ use std::time::{Duration, Instant};
 
 use tetra_config::bluestation::{CfgT1Test, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, BurstType, Sap, TdmaTime, TrainingSequence};
-use tetra_saps::tp::TpUnitdataReqSlot;
+use tetra_core::{Sap, TdmaTime};
 use tetra_saps::{SapMsg, SapMsgInner};
 
+use crate::t1test::dl_gen::{T1DlGen, T1DlParams};
+use crate::umac::subcomp::bs_sched::MACSCHED_TX_AHEAD;
 use crate::{MessageQueue, TetraEntityTrait};
-
-/// Bit counts of a full normal burst block pair and of the broadcast block
-const NDB_FULL_BLK_BITS: usize = 432;
-const BBK_BITS: usize = 30;
 
 /// Entity driving the stack in BS T1 test mode.
 ///
@@ -19,6 +16,7 @@ const BBK_BITS: usize = 30;
 pub struct T1TestBs {
     cfg: CfgT1Test,
     dltime: TdmaTime,
+    dl_gen: T1DlGen,
 
     started: Instant,
     last_report: Instant,
@@ -29,17 +27,16 @@ pub struct T1TestBs {
 
 impl T1TestBs {
     pub fn new(config: SharedConfig) -> Self {
-        let cfg = config
-            .config()
-            .t1_test
-            .clone()
-            .expect("t1_test config must be set in BsT1 stack mode");
+        let stack_cfg = config.config();
+        let cfg = stack_cfg.t1_test.clone().expect("t1_test config must be set in BsT1 stack mode");
+        let dl_gen = T1DlGen::new(T1DlParams::from_config(&stack_cfg));
         tracing::info!("T1TestBs: initialized, ul_timeslot {}", cfg.ul_timeslot);
 
         let now = Instant::now();
         Self {
             cfg,
             dltime: TdmaTime::default(),
+            dl_gen,
             started: now,
             last_report: now,
             ticks: 0,
@@ -48,20 +45,14 @@ impl T1TestBs {
         }
     }
 
-    /// Phase 1 placeholder downlink: an all-zero normal burst. This keeps the PHY timing loop running
-    /// but is not a valid TETRA downlink. Replaced by sync and T1 content in phase 2.
-    fn build_placeholder_dl_slot(&self) -> SapMsg {
+    /// Builds the downlink slot for the timeslot the PHY transmits next
+    fn build_dl_slot(&mut self, ts: TdmaTime) -> SapMsg {
+        let slot = self.dl_gen.build_slot(ts.add_timeslots(MACSCHED_TX_AHEAD as i32));
         SapMsg {
             sap: Sap::TpSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Phy,
-            msg: SapMsgInner::TpUnitdataReq(TpUnitdataReqSlot {
-                train_type: TrainingSequence::NormalTrainSeq1,
-                burst_type: BurstType::NDB,
-                bbk: Some(BitBuffer::new(BBK_BITS)),
-                blk1: Some(BitBuffer::new(NDB_FULL_BLK_BITS)),
-                blk2: None,
-            }),
+            msg: SapMsgInner::TpUnitdataReq(slot),
         }
     }
 
@@ -106,9 +97,9 @@ impl TetraEntityTrait for T1TestBs {
         self.dltime = ts;
     }
 
-    fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
+    fn tick_end(&mut self, queue: &mut MessageQueue, ts: TdmaTime) -> bool {
         self.ticks += 1;
-        queue.push_back(self.build_placeholder_dl_slot());
+        queue.push_back(self.build_dl_slot(ts));
 
         if self.last_report.elapsed() >= Duration::from_millis(self.cfg.report_interval_ms as u64) {
             self.last_report = Instant::now();
