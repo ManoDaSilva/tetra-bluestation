@@ -10,6 +10,7 @@ use tetra_entities::phy::components::slotter::bitseq;
 use tetra_entities::phy::phy_bs::PhyBs;
 use tetra_entities::t1test::T1TestBs;
 use tetra_entities::t1test::prbs::Prbs511;
+use tetra_entities::t1test::report::T1Counters;
 use tetra_pdus::phy::traits::rxtx_dev::{RxBurstBits, RxSlotBits, RxTxDev, RxTxDevError, TxSlotBits};
 
 use common::default_stack::default_test_config_bs;
@@ -80,23 +81,53 @@ fn t1_stack_transmits_sync_in_frame18_slot1_and_tch72_elsewhere() {
     assert_eq!(num_sync, 2, "one sync burst per multiframe");
 }
 
-/// RF device that reports an uplink burst with a given training sequence every few slots
+/// RF device that reports a T1 uplink burst in every slot: a PRBS payload that continues from burst to burst,
+/// scrambled with the cell code, with a fixed number of bit errors
 struct UplinkDev {
-    train_type: TrainingSequence,
+    scrambling_code: u32,
+    errors_per_burst: usize,
+    /// PRBS phase of the next burst
+    phase: usize,
     burst: Vec<u8>,
-    tick: usize,
+}
+
+impl UplinkDev {
+    fn new(scrambling_code: u32, errors_per_burst: usize) -> Self {
+        Self {
+            scrambling_code,
+            errors_per_burst,
+            phase: 0,
+            burst: vec![0u8; 462],
+        }
+    }
+
+    fn make_burst(&mut self) {
+        let mut reference = vec![0u8; 511 + 432];
+        Prbs511::new().fill(&mut reference);
+        let mut payload = BitBuffer::from_bitarr(&reference[self.phase..self.phase + 432]);
+        scrambler::tetra_scramb_bits(self.scrambling_code, &mut payload);
+        let mut bits = [0u8; 432];
+        payload.to_bitarr(&mut bits);
+        // Spread the errors over both halves of the burst
+        for i in 0..self.errors_per_burst {
+            bits[(i * 97 + 5) % 432] ^= 1;
+        }
+
+        // Normal uplink burst: 4 head bits, block 1, training sequence 1, block 2, 4 tail bits
+        self.burst[4..220].copy_from_slice(&bits[..216]);
+        self.burst[220..242].copy_from_slice(&bitseq::n);
+        self.burst[242..458].copy_from_slice(&bits[216..]);
+        self.phase = (self.phase + 432) % 511;
+    }
 }
 
 impl RxTxDev for UplinkDev {
     fn rxtx_timeslot(&mut self, tx_slot: &[TxSlotBits]) -> Result<Vec<Option<RxSlotBits<'_>>>, RxTxDevError> {
-        self.tick += 1;
-        if self.tick % 3 != 0 {
-            return Ok(vec![]);
-        }
+        self.make_burst();
         Ok(vec![Some(RxSlotBits {
             time: tx_slot[0].time,
             slot: RxBurstBits {
-                train_type: self.train_type,
+                train_type: TrainingSequence::NormalTrainSeq1,
                 bits: &self.burst,
             },
             ..Default::default()
@@ -104,30 +135,85 @@ impl RxTxDev for UplinkDev {
     }
 }
 
-/// Uplink bursts of both normal training sequences are accepted and analyzed without error
+/// Runs the T1 stack against `UplinkDev` and returns the final counters and the exit code
+fn run_uplink(t1: CfgT1Test, errors_per_burst: usize, ticks: usize) -> (T1Counters, i32) {
+    let mut stack_cfg = default_test_config_bs();
+    stack_cfg.t1_test = Some(t1);
+    let cfg = SharedConfig::from_parts(stack_cfg, None);
+    let c = cfg.config();
+    let scramb = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
+
+    let mut router = MessageRouter::new(cfg.clone());
+    router.register_entity(Box::new(PhyBs::new(cfg.clone(), UplinkDev::new(scramb, errors_per_burst))));
+    let t1 = T1TestBs::new(cfg.clone());
+    let handle = t1.handle();
+    router.register_entity(Box::new(t1));
+    router.set_dl_time(TdmaTime::default());
+    router.run_stack(Some(ticks), None);
+    drop(router);
+
+    let shared = handle.lock().unwrap();
+    (shared.total.clone(), shared.exit_code())
+}
+
 #[test]
-fn t1_stack_handles_detected_uplink_bursts() {
-    for train_type in [TrainingSequence::NormalTrainSeq1, TrainingSequence::NormalTrainSeq2] {
-        let mut stack_cfg = default_test_config_bs();
-        stack_cfg.t1_test = Some(CfgT1Test::default());
-        let cfg = SharedConfig::from_parts(stack_cfg, None);
+fn t1_measures_ber_on_the_configured_slot() {
+    let t1 = CfgT1Test {
+        ber_limit_percent: Some(1.0),
+        min_bits: Some(5000),
+        ..Default::default()
+    };
+    // Three multiframes
+    let (c, exit_code) = run_uplink(t1, 3, 3 * 72);
 
-        // 462 bit normal uplink burst filled with PRBS-like data
-        let mut prbs = Prbs511::new();
-        let mut burst = vec![0u8; 462];
-        prbs.fill(&mut burst);
+    // Slot 1, frames 1-17: 17 bursts per multiframe, none from frame 18
+    assert!((50..=51).contains(&c.expected_bursts), "expected {}", c.expected_bursts);
+    assert_eq!(c.detected_bursts, c.expected_bursts);
+    assert_eq!(c.received_bursts, c.expected_bursts);
+    assert_eq!(c.bits, 432 * c.received_bursts);
+    assert_eq!(c.bit_errors, 3 * c.received_bursts);
+    assert_eq!(c.error_bursts, c.received_bursts);
+    assert_eq!(c.errors_per_burst, [0, c.received_bursts, 0, 0, 0]);
+    // 3 errors in 432 bits is 0.69 %, under the 1 % limit, and more than 5000 bits were measured
+    assert_eq!(exit_code, 0);
+}
 
-        let mut router = MessageRouter::new(cfg.clone());
-        router.register_entity(Box::new(PhyBs::new(
-            cfg.clone(),
-            UplinkDev {
-                train_type,
-                burst,
-                tick: 0,
-            },
-        )));
-        router.register_entity(Box::new(T1TestBs::new(cfg.clone())));
-        router.set_dl_time(TdmaTime::default());
-        router.run_stack(Some(60), None);
-    }
+#[test]
+fn t1_fails_when_ber_is_over_the_limit() {
+    let t1 = CfgT1Test {
+        ber_limit_percent: Some(0.5),
+        min_bits: Some(5000),
+        ..Default::default()
+    };
+    let (c, exit_code) = run_uplink(t1, 3, 3 * 72);
+    assert!(c.bits > 5000);
+    assert_eq!(exit_code, 1);
+}
+
+#[test]
+fn t1_is_unsettled_before_min_bits() {
+    let t1 = CfgT1Test {
+        ber_limit_percent: Some(5.0),
+        min_bits: Some(10_000_000),
+        ..Default::default()
+    };
+    let (_, exit_code) = run_uplink(t1, 0, 2 * 72);
+    assert_eq!(exit_code, 2);
+}
+
+#[test]
+fn t1_measures_all_four_slots_when_asked() {
+    let t1 = CfgT1Test {
+        measure_all_slots: true,
+        ..Default::default()
+    };
+    let (c, exit_code) = run_uplink(t1, 0, 3 * 72);
+
+    // Frames 1-17 of every slot: 68 bursts per multiframe
+    assert!((200..=204).contains(&c.expected_bursts), "expected {}", c.expected_bursts);
+    assert_eq!(c.received_bursts, c.expected_bursts);
+    assert_eq!(c.bit_errors, 0);
+    assert_eq!(c.errors_per_burst[0], c.received_bursts);
+    // No limit configured: any received bits count as success
+    assert_eq!(exit_code, 0);
 }

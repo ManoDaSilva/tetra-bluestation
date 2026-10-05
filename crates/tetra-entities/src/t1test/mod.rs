@@ -4,6 +4,7 @@
 pub mod t1_entity;
 pub use t1_entity::T1TestBs;
 
-pub mod diag;
+pub mod ber;
 pub mod dl_gen;
 pub mod prbs;
+pub mod report;

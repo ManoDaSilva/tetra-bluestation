@@ -229,7 +229,6 @@ impl T1DlGen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::t1test::prbs::PRBS_PERIOD;
     use tetra_core::{PhyBlockNum, PhyBlockType};
     use tetra_saps::tp::TpUnitdataInd;
 
@@ -318,7 +317,6 @@ mod tests {
         let mut expect = [0u8; 432];
         p.fill(&mut expect);
         assert_eq!(rx, expect);
-        assert!(432 < 2 * PRBS_PERIOD);
 
         // Frame 18 slots 2-4 and slot 1 of other frames are also TCH/7,2
         assert_eq!(gen_.build_slot(ts(3, 18)).burst_type, BurstType::NDB);

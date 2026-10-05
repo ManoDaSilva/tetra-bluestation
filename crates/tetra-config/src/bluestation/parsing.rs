@@ -216,6 +216,30 @@ mod tests {
     }
 
     #[test]
+    fn t1_optional_settings_parse() {
+        let toml = T1_CONFIG.replace(
+            "ul_timeslot = 1",
+            "ul_timeslot = 2\nmeasure_all_slots = true\noutput = \"json\"\nber_limit_percent = 0.448\nmin_bits = 3600000",
+        );
+        let cfg = from_toml_str(&toml).unwrap();
+        let t1 = cfg.t1_test.as_ref().unwrap();
+        assert_eq!(t1.ul_timeslot, 2);
+        assert!(t1.measure_all_slots);
+        assert_eq!(t1.output, super::super::T1OutputFormat::Json);
+        assert_eq!(t1.ber_limit_percent, Some(0.448));
+        assert_eq!(t1.min_bits, Some(3_600_000));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn t1_mode_rejects_bad_limits() {
+        let cfg = from_toml_str(&T1_CONFIG.replace("ul_timeslot = 1", "ul_timeslot = 1\nber_limit_percent = 0")).unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg = from_toml_str(&T1_CONFIG.replace("ul_timeslot = 1", "ul_timeslot = 1\nmin_bits = 0")).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn t1_mode_rejects_unknown_fields() {
         assert!(from_toml_str(&T1_CONFIG.replace("ul_timeslot = 1", "ul_timeslot = 1\nbogus = 2")).is_err());
     }

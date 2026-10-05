@@ -27,7 +27,7 @@ use tetra_entities::{
     mm::mm_bs::MmBs,
     phy::{components::soapy_dev::RxTxDevSoapySdr, phy_bs::PhyBs},
     sndcp::sndcp_bs::Sndcp,
-    t1test::T1TestBs,
+    t1test::{T1TestBs, report::T1SharedHandle},
     umac::umac_bs::UmacBs,
 };
 
@@ -179,7 +179,7 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
 
 /// Start the BS T1 test mode stack: PHY and the T1 test entity only.
 /// Brew, telemetry, control and the signalling entities are not built.
-fn build_t1_stack(cfg: &SharedConfig) -> MessageRouter {
+fn build_t1_stack(cfg: &SharedConfig) -> (MessageRouter, T1SharedHandle) {
     let mut router = MessageRouter::new(cfg.clone());
 
     match cfg.config().phy_io.backend {
@@ -193,11 +193,13 @@ fn build_t1_stack(cfg: &SharedConfig) -> MessageRouter {
         }
     }
 
-    router.register_entity(Box::new(T1TestBs::new(cfg.clone())));
+    let t1 = T1TestBs::new(cfg.clone());
+    let t1_handle = t1.handle();
+    router.register_entity(Box::new(t1));
     eprintln!(" -> BS T1 test mode: network features disabled");
 
     router.set_dl_time(TdmaTime::default());
-    router
+    (router, t1_handle)
 }
 
 #[derive(Parser, Debug)]
@@ -214,9 +216,10 @@ struct Args {
     config: String,
 }
 
-/// Run the BS T1 test mode until Ctrl+C or until the configured duration has passed
-fn run_t1_mode(cfg: &SharedConfig) {
-    let mut router = build_t1_stack(cfg);
+/// Run the BS T1 test mode until Ctrl+C or until the configured duration has passed.
+/// Prints a final report and exits with 0 (pass), 1 (fail) or 2 (no usable measurement)
+fn run_t1_mode(cfg: &SharedConfig) -> ! {
+    let (mut router, t1_handle) = build_t1_stack(cfg);
 
     let is_running = Arc::new(AtomicBool::new(true));
     let is_running_ctrlc = is_running.clone();
@@ -234,6 +237,12 @@ fn run_t1_mode(cfg: &SharedConfig) {
     }
 
     router.run_stack(None, Some(is_running));
+
+    // Dropping the router drops the T1 entity, which publishes its last counts
+    drop(router);
+    let shared = t1_handle.lock().expect("T1 shared state");
+    println!("{}", shared.final_report().render(shared.cfg.output));
+    std::process::exit(shared.exit_code());
 }
 
 fn main() {
@@ -255,7 +264,6 @@ fn main() {
 
     if cfg.config().t1_test.is_some() {
         run_t1_mode(&cfg);
-        return;
     }
 
     let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg);

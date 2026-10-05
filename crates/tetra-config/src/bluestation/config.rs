@@ -89,6 +89,12 @@ impl StackConfig {
             if t1.report_interval_ms < 100 {
                 return Err("t1_test.report_interval_ms must be at least 100");
             }
+            if t1.ber_limit_percent.is_some_and(|l| !(l > 0.0 && l <= 100.0)) {
+                return Err("t1_test.ber_limit_percent must be above 0 and at most 100");
+            }
+            if t1.min_bits == Some(0) {
+                return Err("t1_test.min_bits must be at least 1");
+            }
         }
 
         // Check input device settings

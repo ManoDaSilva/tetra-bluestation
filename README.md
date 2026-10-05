@@ -20,6 +20,17 @@ The documentation repository contains:
 
 Contributions to the documentation follow the same pull-request-based workflow as the main codebase, see the appropriate "Contributions" chapter.
 
+## BS T1 test mode
+
+For receiver validation with a TETRA radio test set (tested with an IFR 2968 in BS T1 mode), set `stack_mode = "BsT1"`. The stack then runs only the PHY and a test entity: no Brew, telemetry, control or signalling entities. See `example_config/config_t1.toml`.
+
+- The base station transmits the sync burst (BSCH and BNCH/T, announcing T1 channel type 7) in frame 18, slot 1, and a PRBS TCH/7,2 signal in all other slots (EN 300 394-1, clause 9.2.2).
+- The test set sends T1 type 7 (TCH/7,2, ITU-T O.153 PRBS-511) on the uplink. The stack compares every received burst with the PRBS and reports bit errors once per interval.
+- The report line shows detected and received bursts, the bit error ratio over the whole run and over the last interval, the share of bursts with errors, an errors-per-burst histogram, and the split of errors between the two halves of a burst. A burst is counted as received when it matches the PRBS with at most 30 % bit errors, so very weak signals show up as missing bursts instead of in the BER.
+- With `ber_limit_percent` and `min_bits` set (EN 300 394-1 Table A.5 lists values per test case), the report also shows how far the measurement has settled and a PASS or FAIL verdict.
+- `output = "json"` prints one JSON object per line, for scripts. The last line has `"final": true`. The process exit code is 0 for pass, 1 for fail and 2 when no usable measurement was made (no bits, or fewer than `min_bits`). Set `duration_s` to make a run end by itself.
+- On the test set, use SYNC TO BASE STATION = AUTO and MCC-MNC-BCC UPDATE = AUTO, set the Rx offset to the duplex spacing of the cell, and BS Tx mode to CONTINUOUS ALL SLOTS.
+
 ## Acknowledgements
 
 - Thanks to Harald Welte and the osmocom crew for their amazing initial work on osmocom-tetra, without which this project would not have existed. 

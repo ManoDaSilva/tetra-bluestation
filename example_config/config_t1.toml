@@ -21,6 +21,17 @@ stack_mode = "BsT1"
 report_interval_ms = 1000
 # Uplink timeslot (1-4) on which the test set transmits its T1 signal
 ul_timeslot = 1
+# Also measure on the other three timeslots. The test set sends the same type 7 (TCH/7,2) signal there,
+# so the measurement collects four times as many bits per second. Leave off to follow the spec (timeslot 1 only).
+# measure_all_slots = true
+# Report format: "console" (one text line per interval) or "json" (one JSON object per line, for scripts)
+# output = "console"
+# Pass or fail verdict. Values for channel type 7 (TCH/7,2) from EN 300 394-1 Table A.5 (BS receiver, class A):
+#   nominal error, TU50, -85 dBm:  spec 0.4 %, test limit 0.448 %, minimum 3600000 bits
+#   nominal error, STAT, -20 dBm:  spec 0.1 %, test limit 0.122 %, minimum 170000 bits
+#   intermodulation, blocking, spurious, STAT, -112 dBm: spec 3.0 %, test limit 3.66 %, minimum 5800 bits
+# ber_limit_percent = 0.448
+# min_bits = 3600000
 # Stop after this many seconds. Remove to run until Ctrl+C
 # duration_s = 60
 

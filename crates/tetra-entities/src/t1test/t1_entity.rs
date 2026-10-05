@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tetra_config::bluestation::{CfgT1Test, SharedConfig};
@@ -5,10 +6,18 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{PhyBlockNum, Sap, TdmaTime, TrainingSequence};
 use tetra_saps::{SapMsg, SapMsgInner};
 
-use crate::t1test::diag::{self, PAYLOAD_BITS};
+use crate::lmac::components::scrambler;
+use crate::t1test::ber::{BURST_BITS, PrbsFitter};
 use crate::t1test::dl_gen::{T1DlGen, T1DlParams};
+use crate::t1test::report::{LinkState, T1Counters, T1Report, T1Shared, T1SharedHandle};
 use crate::umac::subcomp::bs_sched::MACSCHED_TX_AHEAD;
 use crate::{MessageQueue, TetraEntityTrait};
+
+/// The test set sends the PRBS in frames 1-17. Frame 18 carries a control channel
+const LAST_MEASURED_FRAME: u8 = 17;
+
+/// A link state is reported as lock or signal for this many ticks after the last matching or detected burst (about 2 s)
+const STATE_HOLD_TICKS: u64 = 142;
 
 /// Entity driving the stack in BS T1 test mode.
 ///
@@ -18,44 +27,63 @@ pub struct T1TestBs {
     cfg: CfgT1Test,
     dltime: TdmaTime,
     dl_gen: T1DlGen,
+    fitter: PrbsFitter,
 
     started: Instant,
     last_report: Instant,
     ticks: u64,
-    /// Uplink bursts detected by the PHY, per uplink timeslot (index 0 is timeslot 1)
-    ul_bursts_per_slot: [u64; 4],
-    /// Uplink bursts detected by the PHY, per training sequence: [normal 1, normal 2, extended]
-    ul_bursts_per_train: [u64; 3],
+    last_detected_tick: Option<u64>,
+    last_received_tick: Option<u64>,
 
-    /// First half of a burst with two separate blocks, until the second half arrives
-    pending_blk1: Option<[u8; PAYLOAD_BITS / 2]>,
-    /// Number of detected bursts analyzed against the PRBS so far
-    diag_count: u32,
+    /// Counts since the last report
+    interval: T1Counters,
+    /// Counts since the start, also published in `shared`
+    total: T1Counters,
+    shared: T1SharedHandle,
 }
-
-/// Number of detected uplink bursts that get a diagnostic line
-const DIAG_MAX_BURSTS: u32 = 30;
 
 impl T1TestBs {
     pub fn new(config: SharedConfig) -> Self {
         let stack_cfg = config.config();
         let cfg = stack_cfg.t1_test.clone().expect("t1_test config must be set in BsT1 stack mode");
         let dl_gen = T1DlGen::new(T1DlParams::from_config(&stack_cfg));
-        tracing::info!("T1TestBs: initialized, ul_timeslot {}", cfg.ul_timeslot);
+        tracing::info!(
+            "T1TestBs: initialized, ul_timeslot {}, all slots {}",
+            cfg.ul_timeslot,
+            cfg.measure_all_slots
+        );
 
         let now = Instant::now();
+        let shared = Arc::new(Mutex::new(T1Shared {
+            cfg: cfg.clone(),
+            started: now,
+            total: T1Counters::default(),
+            state: LinkState::NoSignal,
+        }));
         Self {
             cfg,
             dltime: TdmaTime::default(),
             dl_gen,
+            fitter: PrbsFitter::new(),
             started: now,
             last_report: now,
             ticks: 0,
-            ul_bursts_per_slot: [0; 4],
-            ul_bursts_per_train: [0; 3],
-            pending_blk1: None,
-            diag_count: 0,
+            last_detected_tick: None,
+            last_received_tick: None,
+            interval: T1Counters::default(),
+            total: T1Counters::default(),
+            shared,
         }
+    }
+
+    /// Handle for reading the measurement from outside the stack, for example to print the final report
+    pub fn handle(&self) -> T1SharedHandle {
+        self.shared.clone()
+    }
+
+    /// True if an uplink burst at this time belongs to the measurement
+    fn is_measured(&self, ul_time: TdmaTime) -> bool {
+        ul_time.f <= LAST_MEASURED_FRAME && (self.cfg.measure_all_slots || ul_time.t == self.cfg.ul_timeslot)
     }
 
     /// Builds the downlink slot for the timeslot the PHY transmits next
@@ -76,73 +104,63 @@ impl T1TestBs {
 
         // Uplink bursts arrive two timeslots after the downlink slot they were sent in
         let ul_time = self.dltime.add_timeslots(-2);
-        self.ul_bursts_per_slot[ul_time.t as usize - 1] += 1;
-        match prim.train_type {
-            TrainingSequence::NormalTrainSeq1 => self.ul_bursts_per_train[0] += 1,
-            TrainingSequence::NormalTrainSeq2 => self.ul_bursts_per_train[1] += 1,
-            TrainingSequence::ExtendedTrainSeq => self.ul_bursts_per_train[2] += 1,
-            _ => {}
-        }
-
-        // Collect the 432 payload bits of the burst and run the diagnostic on the first few
-        if self.diag_count >= DIAG_MAX_BURSTS {
+        if !self.is_measured(ul_time) {
             return;
         }
+
+        // Type 7 is a full-slot normal burst with training sequence 1: one block of 432 bits.
+        // Anything else (half-slot blocks, control bursts) is not part of this signal
         let mut block = prim.block;
-        let payload = match prim.block_num {
-            PhyBlockNum::Both if block.get_len() == PAYLOAD_BITS => {
-                let mut p = [0u8; PAYLOAD_BITS];
-                block.to_bitarr(&mut p);
-                Some(p)
-            }
-            PhyBlockNum::Block1 if block.get_len() == PAYLOAD_BITS / 2 => {
-                let mut p = [0u8; PAYLOAD_BITS / 2];
-                block.to_bitarr(&mut p);
-                self.pending_blk1 = Some(p);
-                None
-            }
-            PhyBlockNum::Block2 if block.get_len() == PAYLOAD_BITS / 2 => self.pending_blk1.take().map(|b1| {
-                let mut p = [0u8; PAYLOAD_BITS];
-                p[..PAYLOAD_BITS / 2].copy_from_slice(&b1);
-                block.to_bitarr(&mut p[PAYLOAD_BITS / 2..]);
-                p
-            }),
-            _ => None,
-        };
-        if let Some(payload) = payload {
-            self.diag_count += 1;
-            let fits = diag::analyze(&payload, self.dl_gen.scrambling_code());
-            let list: Vec<String> = fits.iter().map(|f| format!("{} {}", f.hypothesis, f.errors)).collect();
-            let best = fits.iter().min_by_key(|f| f.errors).unwrap();
-            println!(
-                "T1 diag {}/{} | f{} ts{} | train {:?} | errors vs PRBS of 432 bits: [{}] | best {} phase {}",
-                self.diag_count,
-                DIAG_MAX_BURSTS,
-                ul_time.f,
-                ul_time.t,
-                prim.train_type,
-                list.join(", "),
-                best.hypothesis,
-                best.phase
-            );
+        if prim.train_type != TrainingSequence::NormalTrainSeq1 || prim.block_num != PhyBlockNum::Both || block.get_len() != BURST_BITS {
+            return;
+        }
+        self.interval.detected_bursts += 1;
+        self.last_detected_tick = Some(self.ticks);
+
+        // TCH/7,2 is only scrambled: descramble and compare with the PRBS
+        scrambler::tetra_scramb_bits(self.dl_gen.scrambling_code(), &mut block);
+        let mut payload = [0u8; BURST_BITS];
+        block.to_bitarr(&mut payload);
+
+        let fit = self.fitter.fit(&payload);
+        if fit.is_received() {
+            self.interval.add_received(&fit);
+            self.last_received_tick = Some(self.ticks);
         }
     }
 
-    fn print_report(&mut self) {
-        let s = &self.ul_bursts_per_slot;
-        let t = &self.ul_bursts_per_train;
-        println!(
-            "T1 | t {:>6.1}s | ticks {} | UL bursts per slot [{} {} {} {}] | per train seq [n1 {} n2 {} ext {}] | measurement not implemented yet",
-            self.started.elapsed().as_secs_f32(),
-            self.ticks,
-            s[0],
-            s[1],
-            s[2],
-            s[3],
-            t[0],
-            t[1],
-            t[2],
+    fn link_state(&self) -> LinkState {
+        let recent = |t: Option<u64>| t.is_some_and(|t| self.ticks - t <= STATE_HOLD_TICKS);
+        if recent(self.last_received_tick) {
+            LinkState::Lock
+        } else if recent(self.last_detected_tick) {
+            LinkState::Search
+        } else {
+            LinkState::NoSignal
+        }
+    }
+
+    /// Folds the interval into the totals, publishes them and prints a report
+    fn report(&mut self) {
+        self.total.add(&self.interval);
+        let state = self.link_state();
+        let report = T1Report::build(
+            &self.cfg,
+            self.started.elapsed().as_secs_f64(),
+            state,
+            &self.interval,
+            &self.total,
+            false,
         );
+        println!("{}", report.render(self.cfg.output));
+        self.interval = T1Counters::default();
+        self.publish(state);
+    }
+
+    fn publish(&self, state: LinkState) {
+        let mut shared = self.shared.lock().expect("T1 shared state");
+        shared.total = self.total.clone();
+        shared.state = state;
     }
 }
 
@@ -160,6 +178,10 @@ impl TetraEntityTrait for T1TestBs {
 
     fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
+        // The uplink slot that the PHY reports in this tick
+        if self.is_measured(ts.add_timeslots(-2)) {
+            self.interval.expected_bursts += 1;
+        }
     }
 
     fn tick_end(&mut self, queue: &mut MessageQueue, ts: TdmaTime) -> bool {
@@ -168,8 +190,18 @@ impl TetraEntityTrait for T1TestBs {
 
         if self.last_report.elapsed() >= Duration::from_millis(self.cfg.report_interval_ms as u64) {
             self.last_report = Instant::now();
-            self.print_report();
+            self.report();
         }
         false
+    }
+}
+
+impl Drop for T1TestBs {
+    /// Publish whatever was counted since the last report, so the final report is complete
+    fn drop(&mut self) {
+        self.total.add(&self.interval);
+        self.interval = T1Counters::default();
+        let state = self.link_state();
+        self.publish(state);
     }
 }
